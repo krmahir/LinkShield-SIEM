@@ -1,0 +1,54 @@
+
+# Python virtual environments
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environment variables and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+secrets.json
+
+# LinkShield runtime data
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.log
+*.pcap
+*.pcapng
+agent/windows_events_cursor.json
+**/capture.status
+**/capture.session
+*.pid
+
+# GeoIP databases - obtain separately
+*.mmdb
+
+# Frontend dependencies and build
+node_modules/
+dashboard/dist/
+dashboard/.vite/
+dist/
+build/
+
+# IDE and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temporary files and archives
+*.tmp
+*.bak
+*.zip
