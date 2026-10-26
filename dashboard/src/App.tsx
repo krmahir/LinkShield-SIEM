@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import LiveTraffic from "./components/LiveTraffic";
 import TrafficMap from ".//TrafficMap";
 import BandwidthTimeline from "./components/BandwidthTimeline";
+import UnifiedEventExplorer from "./components/UnifiedEventExplorer";
 import {
   Activity,
   ArrowDownRight,
@@ -402,6 +403,7 @@ function App() {
         <section className="panel events-panel" id="events">
           <BandwidthTimeline />
           <LiveTraffic />
+          <UnifiedEventExplorer />
           <div className="panel-header events-header">
             <div>
               <h2>Event explorer</h2>

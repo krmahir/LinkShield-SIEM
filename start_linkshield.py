@@ -173,7 +173,6 @@ def main() -> int:
 
     backend_python = BACKEND / ".venv" / "Scripts" / "python.exe"
     agent_python = AGENT / ".venv" / "Scripts" / "python.exe"
-    npm = shutil.which("npm.cmd") or shutil.which("npm")
     try:
         verify_file(backend_python, "Backend Python")
         verify_file(agent_python, "Agent Python")
@@ -181,14 +180,10 @@ def main() -> int:
         verify_file(AGENT / "flow_capture.py", "Packet capture collector")
         verify_file(AGENT / "elevated_capture.py", "Elevated capture supervisor")
         verify_file(AGENT / "run_agent.py", "Connection event collector")
-        verify_file(DASHBOARD / "package.json", "Frontend package manifest")
-        if npm is None:
-            raise FileNotFoundError("npm.cmd not found. Install Node.js and reopen PowerShell.")
-        if not (DASHBOARD / "node_modules").is_dir():
-            raise FileNotFoundError("Dashboard dependencies absent. Run: cd dashboard; npm install")
-        for port in (8001, 5173):
-            if port_is_busy(port):
-                raise RuntimeError(f"Port {port} is already in use. Stop your old LinkShield windows first.")
+        if not (DASHBOARD / "dist" / "index.html").is_file():
+            raise FileNotFoundError("Run: cd dashboard; npm run build")
+        if port_is_busy(8001):
+            raise RuntimeError("Port 8001 is already in use.")
     except (FileNotFoundError, RuntimeError) as exc:
         log(f"[ERROR] {exc}")
         return 2
@@ -197,7 +192,7 @@ def main() -> int:
     log("=== LinkShield SIEM (development) ===")
     log("Running API and dashboard as a standard user.")
     log("Network packet capture requests a SEPARATE UAC prompt.")
-    log("Dashboard: http://127.0.0.1:5173")
+    log("Dashboard: http://127.0.0.1:8001")
     log("Press Ctrl+C here to stop the managed stack.\n")
 
     # Marker lives in the system temp directory, not the OneDrive project folder.
@@ -222,15 +217,18 @@ def main() -> int:
                 log("[ERROR] API failed to become available on port 8001.")
                 return 1
 
-            ui = start_service(
-                "Dashboard",
-                [str(npm), "run", "dev", "--", "--host", "127.0.0.1",
-                 "--port", "5173", "--strictPort"],
-                DASHBOARD,
-            )
-            running.append(("Dashboard", ui))
-            if not wait_for_http("http://127.0.0.1:5173", ui):
-                log("[ERROR] Dashboard failed to become available on port 5173.")
+            # FastAPI serves the compiled React dashboard.
+            try:
+                with urllib.request.urlopen(
+                    "http://127.0.0.1:8001/", timeout=3
+                ) as response:
+                    if "text/html" not in response.headers.get(
+                        "Content-Type", ""
+                    ):
+                        log("[ERROR] React dashboard not served.")
+                        return 1
+            except (OSError, urllib.error.URLError) as exc:
+                log(f"[ERROR] Dashboard unavailable: {exc}")
                 return 1
 
             if not args.windows_events:
@@ -278,10 +276,10 @@ def main() -> int:
                     return 1
 
             log("\n[READY] API and dashboard are available; collectors started.")
-            log("[OPEN] http://127.0.0.1:5173")
+            log("[OPEN] http://127.0.0.1:8001")
             if not args.no_browser:
                 try:
-                    webbrowser.open("http://127.0.0.1:5173")
+                    webbrowser.open("http://127.0.0.1:8001")
                 except OSError:
                     log("[WARN] Could not open browser automatically; use the URL above.")
             status_read_warning_shown = False

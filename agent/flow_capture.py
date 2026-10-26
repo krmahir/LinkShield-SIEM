@@ -25,15 +25,18 @@ from dns_correlator import DNSCorrelator
 
 API_URL = "http://127.0.0.1:8001/flows"
 
-WINDOWS_INTERFACE = "Wi-Fi"
-SCAPY_INTERFACE_INDEX = 18
+# Automatically select the network interface used
+# to reach the Internet.
+
+INTERFACE = conf.route.route("1.1.1.1")[0]
+
+if not INTERFACE:
+    INTERFACE = conf.iface
+
+print(f"[NETWORK] Selected interface: {INTERFACE}")
 
 FLUSH_INTERVAL = 5
 MAX_BATCH_SIZE = 200
-
-INTERFACE = conf.ifaces.dev_from_index(
-    SCAPY_INTERFACE_INDEX
-)
 
 lock = threading.Lock()
 pending_flows = {}
@@ -43,20 +46,23 @@ dns_correlator = DNSCorrelator()
 
 def get_local_ips():
     addresses = set()
+    interface_stats = psutil.net_if_stats()
 
-    for address in psutil.net_if_addrs().get(
-        WINDOWS_INTERFACE, []
-    ):
-        if address.family in (
-            socket.AF_INET,
-            socket.AF_INET6,
-        ):
-            addresses.add(
-                address.address.split("%")[0]
-            )
+    for name, entries in psutil.net_if_addrs().items():
+        stats = interface_stats.get(name)
+
+        if not stats or not stats.isup:
+            continue
+
+        for address in entries:
+            if address.family in (socket.AF_INET, socket.AF_INET6):
+
+                ip = address.address.split("%")[0]
+
+                if ip not in ("127.0.0.1", "::1"):
+                    addresses.add(ip)
 
     return addresses
-
 
 LOCAL_IPS = get_local_ips()
 
