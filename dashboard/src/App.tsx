@@ -3,6 +3,7 @@ import LiveTraffic from "./components/LiveTraffic";
 import TrafficMap from ".//TrafficMap";
 import BandwidthTimeline from "./components/BandwidthTimeline";
 import UnifiedEventExplorer from "./components/UnifiedEventExplorer";
+import CollectorHealth from "./components/CollectorHealth";
 import {
   Activity,
   ArrowDownRight,
@@ -403,6 +404,7 @@ function App() {
         <section className="panel events-panel" id="events">
           <BandwidthTimeline />
           <LiveTraffic />
+          <CollectorHealth />
           <UnifiedEventExplorer />
           <div className="panel-header events-header">
             <div>

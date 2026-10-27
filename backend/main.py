@@ -33,6 +33,8 @@ from pydantic import BaseModel, Field
 from detection import detect_remote_ip
 
 
+
+
 # ---------------------------------------------------------------------------
 # Paths and configuration
 # ---------------------------------------------------------------------------
@@ -221,6 +223,17 @@ install_unified_timeline(DATABASE_PATH)
 
 app.include_router(
     create_timeline_router(DATABASE_PATH)
+)
+
+from collector_health import (
+    create_collector_health_router,
+    install_collector_health,
+)
+
+install_collector_health(DATABASE_PATH)
+
+app.include_router(
+    create_collector_health_router(DATABASE_PATH)
 )
 
 # ---------------------------------------------------------------------------

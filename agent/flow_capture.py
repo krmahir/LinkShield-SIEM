@@ -1,4 +1,4 @@
-
+import os 
 import socket
 import threading
 import time
@@ -24,6 +24,7 @@ from dns_correlator import DNSCorrelator
 
 
 API_URL = "http://127.0.0.1:8001/flows"
+HEARTBEAT_URL = "http://127.0.0.1:8001/collectors/heartbeat"
 
 # Automatically select the network interface used
 # to reach the Internet.
@@ -267,6 +268,33 @@ def flush_flows():
             break
 
 
+def send_capture_heartbeat(status="running"):
+    """Report that the packet collector is alive."""
+
+    payload = {
+        "collector": "packet_capture",
+        "hostname": socket.gethostname(),
+        "status": status,
+        "pid": os.getpid(),
+        "detail": (
+            "Scapy packet capture running"
+            if status == "running"
+            else "Packet collector stopped"
+        ),
+    }
+
+    try:
+        response = requests.post(
+            HEARTBEAT_URL,
+            json=payload,
+            timeout=2,
+        )
+        response.raise_for_status()
+
+    except requests.RequestException as error:
+        print(f"[HEARTBEAT WARN] {error}")
+
+
 def main():
     if not LOCAL_IPS:
         raise RuntimeError(
@@ -287,11 +315,30 @@ def main():
             store=False,
             promisc=False,
         )
+        
         sniffer.start()
+        time.sleep(1)
+
+        if not sniffer.running:
+            raise RuntimeError(
+                "Scapy packet capture failed to start"
+            )
+
         print("[STARTED] Capturing network packets")
+
+        send_capture_heartbeat("running")
+
         while True:
             time.sleep(FLUSH_INTERVAL)
+
+            if not sniffer.running:
+                raise RuntimeError(
+                    "Scapy packet capture stopped unexpectedly"
+                )
+
             flush_flows()
+            send_capture_heartbeat("running")
+
 
     except KeyboardInterrupt:
         print("\n[STOPPING] Flow collector")
@@ -303,6 +350,7 @@ def main():
             flush_flows()
         finally:
             process_resolver.stop()
+            send_capture_heartbeat("stopped")
             print("[STOPPED] Flow collector")
 
 

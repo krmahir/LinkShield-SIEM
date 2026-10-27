@@ -52,3 +52,21 @@ Thumbs.db
 *.tmp
 *.bak
 *.zip
+# Local development backups
+archive/
+
+# Runtime logs
+*.log
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Private runtime state
+*.db
+*.db-wal
+*.db-shm
+windows_events_cursor.json
+
+# Windows Event Log collector state
+agent/windows_events_cursor.json

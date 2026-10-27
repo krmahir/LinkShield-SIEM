@@ -1,0 +1,70 @@
+.collector-health {
+  margin-top: 24px;
+}
+
+.ch-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.ch-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 9px;
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid #3b475a;
+  border-radius: 10px;
+  background: #192436;
+}
+
+.ch-item strong {
+  font-size: 14px;
+  color: #f1f5fa;
+}
+
+.ch-item small {
+  color: #b3c0d1;
+  overflow-wrap: anywhere;
+}
+
+.ch-status {
+  padding: 5px 9px;
+  border-radius: 7px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.ch-active {
+  background: #174d3c;
+  color: #a3f0ce;
+}
+
+.ch-degraded {
+  background: #573c12;
+  color: #ffe0a1;
+}
+
+.ch-stale,
+.ch-stopped {
+  background: #5d2734;
+  color: #ffc0c9;
+}
+
+.ch-not_connected {
+  background: #334052;
+  color: #cbd5e1;
+}
+
+.ch-note {
+  margin-top: 12px;
+  font-size: 12px;
+  color: #9aa8bc;
+}
+
+.ch-error {
+  color: #ffb5c0;
+}

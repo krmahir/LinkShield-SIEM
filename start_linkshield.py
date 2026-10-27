@@ -1,22 +1,24 @@
-"""LinkShield Windows development launcher.
 
-Run from a NORMAL (non-administrator) PowerShell window:
+"""LinkShield SIEM development launcher for Windows.
+
+Commands:
     python start_linkshield.py
+    python start_linkshield.py --windows-events
+    python start_linkshield.py --no-capture
 
-API, web UI, and ordinary network-event monitoring run unprivileged.
-Windows UAC elevates ONLY the separate packet-capture supervisor.
-Use --windows-events to include the privileged Windows Security log collector.
-Use --no-capture to launch the UI and backend without requiring UAC.
-
-Development helper only: not an installed Windows service, not production-ready.
+React is served by FastAPI on 127.0.0.1:8001.
+Only the separate capture supervisor requests UAC.
+A capture failure does not stop the dashboard.
 """
 
 from __future__ import annotations
+from agent.collector_heartbeat import watch_process
+from collections import deque
 
 import argparse
 import ctypes
 import os
-import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -28,10 +30,16 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 
+
 ROOT = Path(__file__).resolve().parent
 BACKEND = ROOT / "backend"
 AGENT = ROOT / "agent"
 DASHBOARD = ROOT / "dashboard"
+
+HOST = "127.0.0.1"
+PORT = 8001
+URL = f"http://{HOST}:{PORT}"
+
 PRINT_LOCK = threading.Lock()
 
 
@@ -40,39 +48,87 @@ def log(message: str) -> None:
         print(message, flush=True)
 
 
-def is_admin() -> bool:
+def running_as_admin() -> bool:
     try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        return bool(
+            ctypes.windll.shell32.IsUserAnAdmin()
+        )
     except (AttributeError, OSError):
         return False
 
 
-def verify_file(path: Path, description: str) -> None:
-    if not path.is_file():
-        raise FileNotFoundError(f"{description} is missing: {path}")
-
-
-def port_is_busy(port: int) -> bool:
+def port_busy() -> bool:
     try:
-        with socket.create_connection(("127.0.0.1", port), timeout=0.4):
+        with socket.create_connection(
+            (HOST, PORT), timeout=0.5
+        ):
             return True
     except OSError:
         return False
 
 
-def read_logs(label: str, process: subprocess.Popen[str]) -> None:
-    if process.stdout is None:
+def check_files(capture: bool) -> tuple[Path, Path]:
+    backend_python = (
+        BACKEND / ".venv" / "Scripts" / "python.exe"
+    )
+    agent_python = (
+        AGENT / ".venv" / "Scripts" / "python.exe"
+    )
+
+    required = {
+        backend_python: "Backend Python virtual environment",
+        agent_python: "Agent Python virtual environment",
+        BACKEND / "main.py": "FastAPI backend",
+        AGENT / "run_agent.py": "Connection event collector",
+        DASHBOARD / "dist" / "index.html": "Compiled React dashboard",
+    }
+
+    if capture:
+        required[
+            AGENT / "flow_capture.py"
+        ] = "Packet collector"
+
+        required[
+            AGENT / "elevated_capture.py"
+        ] = "Elevated supervisor"
+
+    for path, description in required.items():
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"{description} missing: {path}"
+            )
+
+    return backend_python, agent_python
+
+
+def forward_output(
+    name: str,
+    proc: subprocess.Popen[str],
+) -> None:
+    if proc.stdout is None:
         return
+
     try:
-        for line in process.stdout:
+        for line in proc.stdout:
             if line.strip():
-                log(f"[{label}] {line.rstrip()}")
+                log(f"[{name}] {line.rstrip()}")
+
     except (OSError, UnicodeError) as exc:
-        log(f"[{label}] Output stream stopped: {exc}")
+        log(
+            f"[{name}] Log stream stopped: {exc}"
+        )
+
+    finally:
+        proc.stdout.close()
 
 
-def start_service(label: str, command: list[str], cwd: Path) -> subprocess.Popen[str]:
-    log(f"[START] {label}")
+def start_service(
+    name: str,
+    command: list[str],
+    cwd: Path,
+) -> subprocess.Popen[str]:
+    log(f"[START] {name}")
+
     proc = subprocess.Popen(
         command,
         cwd=str(cwd),
@@ -85,246 +141,623 @@ def start_service(label: str, command: list[str], cwd: Path) -> subprocess.Popen
         bufsize=1,
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
     )
-    threading.Thread(target=read_logs, args=(label, proc), daemon=True).start()
+
+    threading.Thread(
+        target=forward_output,
+        args=(name, proc),
+        daemon=True,
+    ).start()
+
     return proc
 
 
-def wait_for_http(url: str, process: subprocess.Popen[str], timeout: float = 25.0) -> bool:
-    deadline = time.monotonic() + timeout
+def wait_for_api(
+    proc: subprocess.Popen[str],
+    seconds: float = 25,
+) -> bool:
+    deadline = time.monotonic() + seconds
+
     while time.monotonic() < deadline:
-        if process.poll() is not None:
+        if proc.poll() is not None:
             return False
+
         try:
-            with urllib.request.urlopen(url, timeout=0.8) as response:
-                if response.status < 500:
+            with urllib.request.urlopen(
+                f"{URL}/health",
+                timeout=1,
+            ) as response:
+                if response.status == 200:
                     return True
+
         except (OSError, urllib.error.URLError):
             pass
+
         time.sleep(0.4)
+
     return False
 
 
-def read_capture_status(path: Path) -> tuple[str | None, str | None]:
-    """Read elevated-agent status without crashing on Windows file/ACL races.
-
-    The elevated process may be updating the file, or Windows may briefly
-    deny access. Return a diagnostic instead of raising from a status check.
-    """
+def read_capture_status(
+    status: Path,
+) -> tuple[str | None, str | None]:
     try:
-        return path.read_text(encoding="utf-8", errors="replace").strip(), None
+        value = status.read_text(
+            encoding="utf-8",
+            errors="replace",
+        ).strip()
+
+        return value, None
+
     except FileNotFoundError:
         return None, None
+
     except OSError as exc:
-        return None, f"{type(exc).__name__}: {exc}"
+        return None, str(exc)
 
 
-def request_elevation(python_exe: Path, helper: Path, session_file: Path,
-                      parent_pid: int, windows_events: bool) -> None:
-    """UAC elevation is limited to the agent venv + capture supervisor."""
-    cmd = ["-u", str(helper), "--session", str(session_file), "--parent-pid", str(parent_pid)]
+def launch_elevated_capture(
+    agent_python: Path,
+    marker: Path,
+    windows_events: bool,
+) -> None:
+    arguments = [
+        "-u",
+        str(AGENT / "elevated_capture.py"),
+        "--session",
+        str(marker),
+        "--parent-pid",
+        str(os.getpid()),
+    ]
+
     if windows_events:
-        cmd.append("--windows-events")
-    params = subprocess.list2cmdline(cmd)
+        arguments.append("--windows-events")
 
-    # ShellExecuteW with the 'runas' verb displays the standard Windows UAC prompt.
-    # lpFile is the agent venv Python; no elevation is applied to this launcher.
     result = ctypes.windll.shell32.ShellExecuteW(
-        None, "runas", str(python_exe), params, str(AGENT), 1,
+        None,
+        "runas",
+        str(agent_python),
+        subprocess.list2cmdline(arguments),
+        str(AGENT),
+        1,
     )
+
     if result <= 32:
-        raise OSError(f"Windows denied or could not launch elevated capture (code {result}).")
+        raise OSError(
+            "UAC declined or launch failed "
+            f"(Windows code {result})"
+        )
 
 
-def stop_process(label: str, process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
+def stop_service(
+    name: str,
+    proc: subprocess.Popen[str],
+) -> None:
+    if proc.poll() is not None:
         return
-    log(f"[STOP] {label}")
+
+    log(f"[STOP] {name}")
+
+    try:
+        proc.send_signal(signal.CTRL_BREAK_EVENT)
+        proc.wait(timeout=3)
+        return
+
+    except (
+        OSError,
+        ValueError,
+        subprocess.TimeoutExpired,
+    ):
+        pass
+
     subprocess.run(
-        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+        [
+            "taskkill",
+            "/PID",
+            str(proc.pid),
+            "/T",
+            "/F",
+        ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=False,
     )
+
     try:
-        process.wait(timeout=3)
+        proc.wait(timeout=3)
+
     except subprocess.TimeoutExpired:
-        log(f"[WARN] {label} did not stop cleanly.")
+        log(
+            f"[WARN] {name} did not exit after taskkill"
+        )
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Start all LinkShield development components.")
-    parser.add_argument("--windows-events", action="store_true",
-                        help="Include Windows Security log monitoring in the elevated agent.")
-    parser.add_argument("--no-capture", action="store_true",
-                        help="Start API, UI and network events without a UAC prompt.")
-    parser.add_argument("--no-browser", action="store_true",
-                        help="Do not automatically open the dashboard in your browser.")
+    parser = argparse.ArgumentParser(
+        description="Run LinkShield locally"
+    )
+
+    parser.add_argument(
+        "--windows-events",
+        action="store_true",
+        help=(
+            "Also collect Windows Security logs "
+            "in the elevated supervisor"
+        ),
+    )
+
+    parser.add_argument(
+        "--no-capture",
+        action="store_true",
+        help=(
+            "Do not request UAC or capture raw packets"
+        ),
+    )
+
+    parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help=(
+            "Do not automatically open the dashboard"
+        ),
+    )
+
     args = parser.parse_args()
 
     if sys.platform != "win32":
-        log("[ERROR] This launcher is for Windows.")
+        log(
+            "[ERROR] The development launcher "
+            "requires Windows"
+        )
         return 2
-    if is_admin():
-        log("[ERROR] The launcher is elevated. Open a NORMAL PowerShell window instead.")
-        log("        Only the network capture agent should receive Administrator access.")
-        return 2
-    if args.windows_events and args.no_capture:
-        parser.error("--windows-events and --no-capture cannot be combined")
 
-    backend_python = BACKEND / ".venv" / "Scripts" / "python.exe"
-    agent_python = AGENT / ".venv" / "Scripts" / "python.exe"
+    if running_as_admin():
+        log(
+            "[ERROR] Run this launcher from normal "
+            "PowerShell, not Administrator"
+        )
+        return 2
+
+    if args.windows_events and args.no_capture:
+        parser.error(
+            "--windows-events cannot be combined "
+            "with --no-capture"
+        )
+
     try:
-        verify_file(backend_python, "Backend Python")
-        verify_file(agent_python, "Agent Python")
-        verify_file(BACKEND / "main.py", "Backend application")
-        verify_file(AGENT / "flow_capture.py", "Packet capture collector")
-        verify_file(AGENT / "elevated_capture.py", "Elevated capture supervisor")
-        verify_file(AGENT / "run_agent.py", "Connection event collector")
-        if not (DASHBOARD / "dist" / "index.html").is_file():
-            raise FileNotFoundError("Run: cd dashboard; npm run build")
-        if port_is_busy(8001):
-            raise RuntimeError("Port 8001 is already in use.")
+        backend_python, agent_python = check_files(
+            not args.no_capture
+        )
+
+        if port_busy():
+            raise RuntimeError(
+                "Port 8001 is already in use; "
+                "close the other LinkShield instance"
+            )
+
     except (FileNotFoundError, RuntimeError) as exc:
         log(f"[ERROR] {exc}")
         return 2
 
-    running: list[tuple[str, subprocess.Popen[str]]] = []
-    log("=== LinkShield SIEM (development) ===")
-    log("Running API and dashboard as a standard user.")
-    log("Network packet capture requests a SEPARATE UAC prompt.")
-    log("Dashboard: http://127.0.0.1:8001")
-    log("Press Ctrl+C here to stop the managed stack.\n")
+    log(
+        "=== LinkShield SIEM v0.4 (development) ==="
+    )
+    log(
+        f"[UI] {URL} "
+        "(React is served by FastAPI)"
+    )
+    log(
+        "[INFO] The API and normal collectors "
+        "run without Administrator privileges"
+    )
+    log(
+        "[INFO] Ctrl+C stops the processes "
+        "started by this launcher"
+    )
 
-    # Marker lives in the system temp directory, not the OneDrive project folder.
-    # The privileged supervisor watches it and the parent PID to know when to stop.
-    with tempfile.TemporaryDirectory(prefix="linkshield_session_", ignore_cleanup_errors=True) as temp_dir:
-        session = Path(temp_dir) / "active.marker"
-        status = Path(temp_dir) / "capture.status"
-        session.write_text("LinkShield local development session\n", encoding="utf-8")
-        # Create the status file BEFORE UAC elevation. This preserves the
-        # original user's file ownership/ACL when the elevated helper writes.
+    processes: list[
+        tuple[str, subprocess.Popen[str]]
+    ] = []
+
+    event_process: subprocess.Popen[str] | None = None
+
+    capture_started = False
+    capture_problem_reported = False
+    event_restart_attempts: deque[float] = deque()
+    event_restart_due: float | None = None
+    event_recovery_disabled = False
+
+    with tempfile.TemporaryDirectory(
+        prefix="linkshield_session_",
+        ignore_cleanup_errors=True,
+    ) as tmp_dir:
+
+        session = Path(tmp_dir) / "active.marker"
+        status_file = Path(tmp_dir) / "capture.status"
+
+        session.write_text(
+            "active\n",
+            encoding="utf-8",
+        )
+
         if not args.no_capture:
-            status.write_text("STARTING", encoding="utf-8")
+            status_file.write_text(
+                "STARTING",
+                encoding="utf-8",
+            )
+
+        def start_network_events() -> None:
+            nonlocal event_process
+
+            if (
+                event_process is not None
+                and event_process.poll() is None
+            ):
+                return
+
+            try:
+                proc = start_service(
+                    "Events",
+                    [
+                        str(agent_python),
+                        "-u",
+                        "run_agent.py",
+                        "--collectors",
+                        "network",
+                    ],
+                    AGENT,
+                )
+
+                event_process = proc
+                processes.append(("Events", proc))
+
+
+                threading.Thread(
+                    target=watch_process,
+                    args=(
+                        proc,
+                        "network_events",
+                        "run_agent.py manager running; "
+                        "event delivery not independently verified",
+                    ),
+                    daemon=True,
+                ).start()
+
+
+                time.sleep(0.5)
+
+                if proc.poll() is not None:
+                    log(
+                        "[WARN] Connection collector "
+                        f"exited with {proc.returncode}"
+                    )
+
+            except OSError as exc:
+                log(
+                    "[WARN] Connection collector "
+                    f"could not start: {exc}"
+                )
+
         try:
             api = start_service(
                 "API",
-                [str(backend_python), "-u", "-m", "uvicorn", "main:app",
-                 "--host", "127.0.0.1", "--port", "8001"],
+                [
+                    str(backend_python),
+                    "-u",
+                    "-m",
+                    "uvicorn",
+                    "main:app",
+                    "--host",
+                    HOST,
+                    "--port",
+                    str(PORT),
+                ],
                 BACKEND,
             )
-            running.append(("API", api))
-            if not wait_for_http("http://127.0.0.1:8001/health", api):
-                log("[ERROR] API failed to become available on port 8001.")
+
+            processes.append(("API", api))
+
+            if not wait_for_api(api):
+                log(
+                    "[ERROR] API failed to start; "
+                    "review [API] output above"
+                )
                 return 1
 
-            # FastAPI serves the compiled React dashboard.
             try:
                 with urllib.request.urlopen(
-                    "http://127.0.0.1:8001/", timeout=3
+                    URL,
+                    timeout=3,
                 ) as response:
-                    if "text/html" not in response.headers.get(
-                        "Content-Type", ""
-                    ):
-                        log("[ERROR] React dashboard not served.")
-                        return 1
-            except (OSError, urllib.error.URLError) as exc:
-                log(f"[ERROR] Dashboard unavailable: {exc}")
-                return 1
 
-            if not args.windows_events:
-                events = start_service(
-                    "Events",
-                    [str(agent_python), "-u", "run_agent.py", "--collectors", "network"],
-                    AGENT,
+                    content_type = response.headers.get(
+                        "Content-Type",
+                        "",
+                    )
+
+                    if "text/html" not in content_type:
+                        log(
+                            "[WARN] API is up but the "
+                            "React dashboard was not served"
+                        )
+
+            except (
+                OSError,
+                urllib.error.URLError,
+            ) as exc:
+                log(
+                    "[WARN] Dashboard root check "
+                    f"failed: {exc}"
                 )
-                running.append(("Events", events))
-                time.sleep(0.5)
-                if events.poll() is not None:
-                    log("[ERROR] Network event collector exited on startup.")
-                    return 1
+
+            # If --windows-events is enabled, the
+            # elevated supervisor runs run_agent with
+            # all collectors. Starting another normal
+            # collector would duplicate network events.
+            if (
+                args.no_capture
+                or not args.windows_events
+            ):
+                start_network_events()
 
             if not args.no_capture:
-                log("[UAC] Accept Administrator permission for the packet collector ONLY.")
+                log(
+                    "[UAC] Approve Administrator access "
+                    "for packet capture only"
+                )
+
                 try:
-                    request_elevation(
-                        agent_python, AGENT / "elevated_capture.py", session,
-                        os.getpid(), args.windows_events,
+                    launch_elevated_capture(
+                        agent_python,
+                        session,
+                        args.windows_events,
                     )
+
                 except OSError as exc:
-                    log(f"[ERROR] {exc}")
-                    return 1
+                    capture_problem_reported = True
 
-                deadline = time.monotonic() + 20.0
-                last_state = "STARTING"
-                last_read_error = None
-                while time.monotonic() < deadline:
-                    state, error = read_capture_status(status)
-                    if error:
-                        last_read_error = error
-                    if state:
-                        last_state = state
-                    if state == "READY":
-                        break
-                    if state and state.startswith("ERROR"):
-                        log(f"[ERROR] Elevated capture failed: {state}")
-                        return 1
-                    time.sleep(0.3)
+                    log(
+                        "[WARN] Packet capture "
+                        f"unavailable: {exc}"
+                    )
+
                 else:
-                    detail = last_read_error or last_state or "No startup acknowledgement"
-                    log(f"[ERROR] Elevated capture was not ready: {detail}")
-                    log("[HINT] Review the elevated capture window for its first error.")
-                    return 1
+                    deadline = time.monotonic() + 20
+                    last_state = "STARTING"
+                    last_error = None
 
-            log("\n[READY] API and dashboard are available; collectors started.")
-            log("[OPEN] http://127.0.0.1:8001")
+                    while time.monotonic() < deadline:
+                        state, error = read_capture_status(
+                            status_file
+                        )
+
+                        if error:
+                            last_error = error
+
+                        if state:
+                            last_state = state
+
+                        if state == "READY":
+                            capture_started = True
+
+                            log(
+                                "[CAPTURE] Elevated "
+                                "capture supervisor is ready"
+                            )
+                            break
+
+                        if state and (
+                            state.startswith("ERROR")
+                            or state == "STOPPED"
+                        ):
+                            log(
+                                "[WARN] Packet capture "
+                                f"failed: {state}"
+                            )
+
+                            capture_problem_reported = True
+                            break
+
+                        time.sleep(0.3)
+
+                    if (
+                        not capture_started
+                        and not capture_problem_reported
+                    ):
+                        log(
+                            "[WARN] Capture did not "
+                            "become ready: "
+                            f"{last_error or last_state}"
+                        )
+
+                        capture_problem_reported = True
+
+                if (
+                    args.windows_events
+                    and not capture_started
+                ):
+                    log(
+                        "[WARN] Falling back to normal "
+                        "network-event collection"
+                    )
+
+                    start_network_events()
+
+            log(
+                "[READY] API and dashboard are available"
+            )
+            log(f"[OPEN] {URL}")
+
             if not args.no_browser:
                 try:
-                    webbrowser.open("http://127.0.0.1:8001")
-                except OSError:
-                    log("[WARN] Could not open browser automatically; use the URL above.")
-            status_read_warning_shown = False
+                    webbrowser.open(URL)
+
+                except OSError as exc:
+                    log(
+                        "[WARN] Browser could not "
+                        f"open automatically: {exc}"
+                    )
+
+            capture_read_warned = False
+            events_exit_warned = False
+
             while True:
-                for name, proc in running:
-                    code = proc.poll()
-                    if code is not None:
-                        log(f"[ERROR] {name} exited with code {code}.")
-                        return 1
-                if not args.no_capture:
-                    current, read_error = read_capture_status(status)
-                    if read_error:
-                        if not status_read_warning_shown:
-                            log(f"[WARN] Capture status temporarily unreadable: {read_error}")
-                            status_read_warning_shown = True
+                code = api.poll()
+
+                if code is not None:
+                    log(
+                        "[ERROR] API exited "
+                        f"with code {code}"
+                    )
+                    return 1
+
+                
+                normal_events_expected = (
+                    args.no_capture
+                    or not args.windows_events
+                    or (
+                        args.windows_events
+                        and capture_problem_reported
+                    )
+                )
+
+                if (
+                    normal_events_expected
+                    and not event_recovery_disabled
+                    and (
+                        event_process is None
+                        or event_process.poll() is not None
+                    )
+                ):
+                    now = time.monotonic()
+
+                    if event_restart_due is None:
+                        # Discard old failures outside the
+                        # five-minute recovery window.
+                        while (
+                            event_restart_attempts
+                            and now - event_restart_attempts[0] > 300
+                        ):
+                            event_restart_attempts.popleft()
+
+                        if len(event_restart_attempts) >= 3:
+                            event_recovery_disabled = True
+                            log(
+                                "[RECOVERY ERROR] Connection events "
+                                "exceeded 3 restart attempts "
+                                "within 5 minutes."
+                            )
+                        else:
+                            event_restart_attempts.append(now)
+
+                            delay = (1, 3, 10)[
+                                len(event_restart_attempts) - 1
+                            ]
+
+                            event_restart_due = now + delay
+
+                            log(
+                                "[RECOVERY] Connection-event "
+                                f"manager stopped. Restarting in "
+                                f"{delay}s "
+                                f"(attempt "
+                                f"{len(event_restart_attempts)}/3)"
+                            )
+
+                    elif now >= event_restart_due:
+                        event_restart_due = None
+                        start_network_events()
+
+                if (
+                    capture_started
+                    and not capture_problem_reported
+                ):
+                    state, error = read_capture_status(
+                        status_file
+                    )
+
+                    if error:
+                        if not capture_read_warned:
+                            log(
+                                "[WARN] Capture status "
+                                "temporarily unreadable: "
+                                f"{error}"
+                            )
+
+                            capture_read_warned = True
+
                     else:
-                        status_read_warning_shown = False
-                    if current and (current.startswith("ERROR") or current == "STOPPED"):
-                        log(f"[ERROR] Capture supervisor status: {current}")
-                        return 1
-                time.sleep(0.6)
+                        capture_read_warned = False
+
+                    if state and (
+                        state.startswith("ERROR")
+                        or state == "STOPPED"
+                    ):
+                        capture_problem_reported = True
+
+                        log(
+                            "[WARN] Packet capture "
+                            f"has stopped: {state}"
+                        )
+
+                        log(
+                            "[WARN] Dashboard and API "
+                            "will remain online"
+                        )
+
+                        if args.windows_events:
+                            log(
+                                "[WARN] Restoring normal "
+                                "network-event collection"
+                            )
+
+                            start_network_events()
+
+                time.sleep(0.7)
+
         except KeyboardInterrupt:
-            log("\n[SHUTDOWN] Ctrl+C received.")
+            log(
+                "\n[SHUTDOWN] Ctrl+C received"
+            )
             return 0
+
         except OSError as exc:
-            log(f"[ERROR] Could not start LinkShield: {exc}")
+            log(
+                f"[ERROR] Could not start LinkShield: {exc}"
+            )
             return 1
+
         finally:
-            # Elevated supervisor notices this marker has vanished and stops capture.
+            # Removing this marker asks the elevated
+            # supervisor to stop its own collectors.
             try:
                 session.unlink(missing_ok=True)
-            except OSError:
-                pass
-            for name, proc in reversed(running):
-                stop_process(name, proc)
-            # Give the elevated supervisor a chance to acknowledge and shut down.
-            deadline = time.monotonic() + 5
-            while not args.no_capture and time.monotonic() < deadline:
-                current, read_error = read_capture_status(status)
-                # This acknowledgement is best-effort; do not crash on a
-                # Windows ACL/sharing violation during elevated shutdown.
-                if current == "STOPPED" or read_error:
-                    break
-                time.sleep(0.25)
-            log("[SHUTDOWN] Normal-user components stopped; capture stop requested.")
+
+            except OSError as exc:
+                log(
+                    "[WARN] Could not remove "
+                    f"session marker: {exc}"
+                )
+
+            for name, proc in reversed(processes):
+                stop_service(name, proc)
+
+            if capture_started:
+                deadline = time.monotonic() + 4
+
+                while time.monotonic() < deadline:
+                    state, _ = read_capture_status(
+                        status_file
+                    )
+
+                    if state == "STOPPED":
+                        break
+
+                    time.sleep(0.25)
+
+            log(
+                "[SHUTDOWN] LinkShield "
+                "normal-user services stopped"
+            )
 
 
 if __name__ == "__main__":
